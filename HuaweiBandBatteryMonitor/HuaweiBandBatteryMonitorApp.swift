@@ -18,12 +18,14 @@ struct HuaweiBandBatteryMonitorApp: App {
                     deviceName: name,
                     isConnected: true
                 )
+                ble.updateAdaptivePolling(isCharging: batteryStore.activeSession?.type == .charging)
             }
         }
 
         ble.onConnectionChanged = { name, connected in
             Task { @MainActor in
                 batteryStore.updateDeviceMetadata(name: name, isConnected: connected)
+                ble.updateAdaptivePolling(isCharging: batteryStore.activeSession?.type == .charging)
             }
         }
 

@@ -29,10 +29,10 @@ struct DashboardView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 18) {
+                VStack(spacing: 16) {
                     statusHeader
                     batteryRingCard
-                    forecastCard
+                    liveCurrentAndForecastCard
                     quickActionsCard
                     sessionMetricsCard
                 }
@@ -68,14 +68,25 @@ struct DashboardView: View {
                     .lineLimit(2)
             }
             Spacer()
-            if bleManager.supportsNotify {
-                Text("Notify")
-                    .font(.caption2.bold())
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.green.opacity(0.15))
-                    .foregroundStyle(.green)
-                    .clipShape(Capsule())
+            VStack(alignment: .trailing, spacing: 4) {
+                if let rssi = bleManager.currentRSSI {
+                    Text("\(rssi) dBm")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                if let bpm = bleManager.liveHeartRateBPM {
+                    Label("\(bpm)", systemImage: "heart.fill")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.red)
+                } else if bleManager.supportsNotify {
+                    Text("Notify")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.green.opacity(0.15))
+                        .foregroundStyle(.green)
+                        .clipShape(Capsule())
+                }
             }
         }
         .padding()
@@ -116,23 +127,23 @@ struct DashboardView: View {
             }
 
             if let updated = store.latestSample?.timestamp ?? bleManager.lastUpdatedAt {
-                Text("Cập nhật lúc \(updated.formatted(date: .omitted, time: .shortened)) • \(store.latestSample?.source.label ?? "BLE")")
+                Text("Cập nhật lúc \(updated.formatted(date: .omitted, time: .shortened)) • \(store.latestSample?.source.label ?? "BLE") • Pin 300 mAh")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 20)
+        .padding(.vertical, 18)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 20))
     }
 
     @ViewBuilder
-    private var forecastCard: some View {
+    private var liveCurrentAndForecastCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let charge = store.chargeEstimate {
                 HStack {
-                    Label("Dự báo sạc đầy", systemImage: "bolt.batteryblock.fill")
+                    Label("Dòng sạc & Dự báo đầy", systemImage: "bolt.batteryblock.fill")
                         .font(.headline)
                         .foregroundStyle(.green)
                     Spacer()
@@ -140,10 +151,10 @@ struct DashboardView: View {
                 }
 
                 if charge.minutesToFull <= 0 {
-                    Text("Pin đã đạt 100% — bạn có thể rút sạc.")
+                    Text("Pin đã đạt 100% — có thể rút sạc")
                         .font(.title3.bold())
                 } else {
-                    Text("Còn khoảng \(DurationFormatter.formatMinutes(charge.minutesToFull))")
+                    Text("Còn ~\(DurationFormatter.formatMinutes(charge.minutesToFull))")
                         .font(.title2.bold())
                     Text("Dự kiến đầy 100% lúc \(charge.estimatedFullDate.formatted(date: .omitted, time: .shortened))")
                         .font(.subheadline)
@@ -152,20 +163,37 @@ struct DashboardView: View {
 
                 Divider()
                 HStack {
-                    metricTile(title: "Tốc độ nạp", value: String(format: "+%.2f%%/phút", charge.ratePerMinute))
+                    metricTile(
+                        title: "Dòng nạp (quy đổi)",
+                        value: String(format: "+%.0f mA", charge.effectiveCurrentmA),
+                        accent: .green
+                    )
                     Spacer()
-                    metricTile(title: "Đã sạc", value: DurationFormatter.formatMinutes(charge.elapsedMinutes))
+                    metricTile(
+                        title: "Tức thời",
+                        value: String(format: "+%.0f mA", charge.instantCurrentmA)
+                    )
+                    Spacer()
+                    metricTile(
+                        title: "Tốc độ",
+                        value: String(format: "+%.2f%%/ph", charge.ratePerMinute)
+                    )
                 }
+                Text("Tính trực tiếp từ biến thiên % BLE trên cell \(Int(BatteryHardwareSpec.capacitymAh)) mAh (~" +
+                     String(format: "%.0f mW", BatteryHardwareSpec.effectivePowermW(currentmA: charge.effectiveCurrentmA)) +
+                     ").")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             } else if let discharge = store.dischargeEstimate {
                 HStack {
-                    Label("Dự báo thời gian dùng", systemImage: "clock.arrow.circlepath")
+                    Label("Dòng xả thực tế & Thời lượng", systemImage: "waveform.path.ecg")
                         .font(.headline)
                         .foregroundStyle(.cyan)
                     Spacer()
                     confidenceBadge(discharge.confidence)
                 }
 
-                Text("Còn khoảng \(DurationFormatter.formatRemainingHours(discharge.remainingHours))")
+                Text("Còn ~\(DurationFormatter.formatRemainingHours(discharge.remainingHours))")
                     .font(.title2.bold())
                 Text("Dự kiến hết pin: \(discharge.estimatedEmptyDate.formatted(date: .abbreviated, time: .shortened))")
                     .font(.subheadline)
@@ -173,16 +201,36 @@ struct DashboardView: View {
 
                 Divider()
                 HStack {
-                    metricTile(title: "Hao pin/giờ", value: String(format: "%.2f%%/h", discharge.drainPerHour))
+                    metricTile(
+                        title: "Dòng xả TB",
+                        value: String(format: "-%.2f mA", discharge.effectiveCurrentmA),
+                        accent: .cyan
+                    )
                     Spacer()
-                    metricTile(title: "Hao pin/ngày", value: String(format: "%.1f%%/ngày", discharge.drainPerDay))
+                    metricTile(
+                        title: "Tức thời",
+                        value: String(format: "-%.2f mA", discharge.instantCurrentmA)
+                    )
                     Spacer()
-                    metricTile(title: "Chu kỳ 100%", value: String(format: "%.1f ngày", discharge.estimatedFullCycleDays))
+                    metricTile(
+                        title: "Hao pin/ngày",
+                        value: String(format: "%.1f%%/ngày", discharge.drainPerDay)
+                    )
+                }
+
+                if discharge.isUsingFallbackPrior {
+                    Text("Đang chờ mẫu % thay đổi đầu tiên qua BLE để thay thế hoàn toàn mốc tham chiếu ban đầu.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                } else {
+                    Text("Hồi quy tuyến tính realtime từ lịch sử BLE (chu kỳ tương đương ~\(String(format: "%.1f", discharge.estimatedFullCycleDays)) ngày / 100%).")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             } else {
-                Label("Chưa có dữ liệu dự báo", systemImage: "waveform.path.ecg")
+                Label("Chưa có dữ liệu BLE", systemImage: "antenna.radiowaves.left.and.right")
                     .font(.headline)
-                Text("Bấm Đồng bộ hoặc kết nối HUAWEI Band 11 qua Bluetooth để bắt đầu ghi nhận mức pin.")
+                Text("Bấm Đồng bộ ở góc trên để đọc mức pin 0x180F từ HUAWEI Band 11 và bắt đầu đo realtime.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -194,42 +242,28 @@ struct DashboardView: View {
     }
 
     private var quickActionsCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Điều khiển phiên & Chế độ đeo")
-                .font(.headline)
-
-            HStack(spacing: 10) {
-                Button {
-                    store.toggleSession(to: isCharging ? .discharging : .charging)
-                } label: {
-                    Label(
-                        isCharging ? "Đánh dấu rút sạc" : "Đánh dấu đang sạc",
-                        systemImage: isCharging ? "battery.100" : "bolt.fill"
-                    )
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(isCharging ? .orange : .green)
-
-                Button {
-                    manualLevel = Double(activeLevel > 0 ? activeLevel : 88)
-                    showingManualLogSheet = true
-                } label: {
-                    Label("Nhập %", systemImage: "plus.circle")
-                }
-                .buttonStyle(.bordered)
+        HStack(spacing: 10) {
+            Button {
+                let nextType: SessionType = isCharging ? .discharging : .charging
+                store.toggleSession(to: nextType)
+                bleManager.updateAdaptivePolling(isCharging: nextType == .charging)
+            } label: {
+                Label(
+                    isCharging ? "Đã rút sạc" : "Đánh dấu sạc",
+                    systemImage: isCharging ? "battery.100" : "bolt.fill"
+                )
+                .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.borderedProminent)
+            .tint(isCharging ? .orange : .green)
 
-            Picker("Chế độ sử dụng Band 11", selection: $store.usageProfile) {
-                ForEach(UsageProfile.allCases) { profile in
-                    Text(profile.shortName).tag(profile)
-                }
+            Button {
+                manualLevel = Double(activeLevel > 0 ? activeLevel : 88)
+                showingManualLogSheet = true
+            } label: {
+                Label("Nhập %", systemImage: "plus.circle")
             }
-            .pickerStyle(.segmented)
-
-            Text("Mốc tham chiếu: \(store.usageProfile.displayName) — thuật toán sẽ tự hiệu chỉnh theo mức hao thực tế.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            .buttonStyle(.bordered)
         }
         .padding()
         .background(.ultraThinMaterial)
@@ -243,9 +277,9 @@ struct DashboardView: View {
                 Text("Phiên hiện tại (\(session.type.displayName))")
                     .font(.headline)
                 HStack {
-                    metricTile(title: "Bắt đầu", value: "\(session.startLevel)% • \(session.startTime.formatted(date: .abbreviated, time: .shortened))")
+                    metricTile(title: "Mốc đầu", value: "\(session.startLevel)% • \(session.startTime.formatted(date: .abbreviated, time: .shortened))")
                     Spacer()
-                    metricTile(title: "Thời lượng", value: DurationFormatter.formatRemainingHours(session.duration() / 3600.0))
+                    metricTile(title: "Đã trôi qua", value: DurationFormatter.formatRemainingHours(session.duration() / 3600.0))
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -280,6 +314,7 @@ struct DashboardView: View {
                             deviceName: bleManager.connectedDeviceName,
                             isConnected: bleManager.connectionState == .connected
                         )
+                        bleManager.updateAdaptivePolling(isCharging: store.activeSession?.type == .charging)
                         showingManualLogSheet = false
                     }
                 }
@@ -290,9 +325,9 @@ struct DashboardView: View {
 
     private func confidenceBadge(_ confidence: PredictionConfidence) -> some View {
         let color: Color = switch confidence {
-        case .high: .green
-        case .medium: .orange
-        case .low: .secondary
+        case .realTimeHigh: .green
+        case .measuring: .cyan
+        case .awaitingDelta: .orange
         }
         return Text(confidence.displayName)
             .font(.caption2.bold())
@@ -303,13 +338,14 @@ struct DashboardView: View {
             .clipShape(Capsule())
     }
 
-    private func metricTile(title: String, value: String) -> some View {
+    private func metricTile(title: String, value: String, accent: Color = .primary) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Text(value)
                 .font(.subheadline.bold())
+                .foregroundStyle(accent)
         }
     }
 }

@@ -75,7 +75,7 @@ final class SDBatterySession {
     }
 }
 
-/// Central reactive store managing SwiftData persistence, session transitions, forecasts, and widget sync.
+/// Central reactive store managing SwiftData persistence, real-time regression forecasts, and widget sync.
 @MainActor
 final class BatteryStore: ObservableObject {
     @Published private(set) var samples: [BatterySampleRecord] = []
@@ -131,7 +131,6 @@ final class BatteryStore: ObservableObject {
         do {
             self.container = try ModelContainer(for: schema, configurations: [config])
         } catch {
-            // Fallback to default local container if App Group URL fails under sideloading constraints.
             let fallbackConfig = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
             do {
                 self.container = try ModelContainer(for: schema, configurations: [fallbackConfig])
@@ -320,18 +319,24 @@ final class BatteryStore: ObservableObject {
         let mode = activeSession?.type ?? .discharging
         let etaSummary: String
         let rateSummary: String
+        let currentSummary: String
 
         if let charge = chargeEstimate {
             etaSummary = charge.minutesToFull <= 0
                 ? "Đã sạc đầy 100%"
                 : "Đầy sau ~\(DurationFormatter.formatMinutes(charge.minutesToFull))"
-            rateSummary = String(format: "+%.1f%%/phút", charge.ratePerMinute)
+            rateSummary = String(format: "+%.2f%%/phút", charge.ratePerMinute)
+            currentSummary = String(format: "+%.0f mA", charge.effectiveCurrentmA)
         } else if let discharge = dischargeEstimate {
-            etaSummary = "Còn ~\(DurationFormatter.formatRemainingHours(discharge.remainingHours))"
-            rateSummary = String(format: "-%.1f%%/ngày", discharge.drainPerDay)
+            etaSummary = discharge.isUsingFallbackPrior
+                ? "Ước tính ~\(DurationFormatter.formatRemainingHours(discharge.remainingHours))"
+                : "Còn ~\(DurationFormatter.formatRemainingHours(discharge.remainingHours))"
+            rateSummary = String(format: "-%.2f%%/h", discharge.drainPerHour)
+            currentSummary = String(format: "-%.2f mA", discharge.effectiveCurrentmA)
         } else {
             etaSummary = "Đang thu thập dữ liệu"
-            rateSummary = usageProfile.shortName
+            rateSummary = "--"
+            currentSummary = "-- mA"
         }
 
         let snapshot = WidgetBatterySnapshot(
@@ -341,6 +346,7 @@ final class BatteryStore: ObservableObject {
             updatedAt: now,
             etaSummary: etaSummary,
             rateSummary: rateSummary,
+            currentSummary: currentSummary,
             isConnected: isConnected
         )
         SharedSnapshotStore.save(snapshot)

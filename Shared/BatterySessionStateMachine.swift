@@ -8,8 +8,9 @@ public struct StateTransitionResult: Equatable, Sendable {
 }
 
 /// Deterministic state machine that splits raw 0x2A19 percentage readings into charging and discharging sessions.
+/// Never drops a percentage change so real-time slope and effective mA calculations remain exact.
 public enum BatterySessionStateMachine {
-    /// Minimum time interval before logging an identical percentage within the same session.
+    /// Minimum time interval before logging an identical unchanged percentage within the same session.
     public static let defaultDeduplicationInterval: TimeInterval = 5 * 60
 
     /// Evaluates a newly observed battery level against the current session and previous sample.
@@ -107,12 +108,13 @@ public enum BatterySessionStateMachine {
             )
         }
 
-        // Same session: update endLevel and deduplicate unchanged readings within the interval.
+        // Same session: always record whenever level changed (delta != 0),
+        // and only deduplicate identical flat readings inside the interval.
         currentSession.endLevel = clampedLevel
         let shouldDeduplicate: Bool
         if let lastSample,
            source != .manual,
-           clampedLevel == lastSample.level,
+           delta == 0,
            timestamp.timeIntervalSince(lastSample.timestamp) < deduplicationInterval {
             shouldDeduplicate = true
         } else {

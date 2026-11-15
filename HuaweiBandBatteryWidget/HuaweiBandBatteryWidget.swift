@@ -17,6 +17,7 @@ struct BatteryWidgetProvider: TimelineProvider {
                 updatedAt: Date(),
                 etaSummary: "Còn ~7 ngày 1 giờ",
                 rateSummary: "-12.5%/ngày",
+                currentSummary: "-1.56 mA",
                 isConnected: true
             )
         )
@@ -40,6 +41,7 @@ struct BatteryWidgetProvider: TimelineProvider {
             updatedAt: Date(),
             etaSummary: "Mở app để đồng bộ",
             rateSummary: "--",
+            currentSummary: "-- mA",
             isConnected: false
         )
         return BatteryWidgetEntry(date: Date(), snapshot: snapshot)
@@ -77,9 +79,10 @@ struct BatteryWidgetEntryView: View {
                     Text(entry.snapshot.etaSummary)
                         .font(.subheadline.bold())
                         .foregroundStyle(accent)
-                    Text("\(entry.snapshot.rateSummary) • \(entry.snapshot.updatedAt.formatted(date: .omitted, time: .shortened))")
+                    Text("\(entry.snapshot.currentSummary) • \(entry.snapshot.rateSummary) • \(entry.snapshot.updatedAt.formatted(date: .omitted, time: .shortened))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 Spacer()
             }
@@ -95,7 +98,7 @@ struct BatteryWidgetEntryView: View {
                         .font(.title2.bold())
                 }
                 Spacer()
-                Text(entry.snapshot.deviceName)
+                Text(entry.snapshot.currentSummary.isEmpty ? entry.snapshot.deviceName : entry.snapshot.currentSummary)
                     .font(.caption.bold())
                     .lineLimit(1)
                 Text(entry.snapshot.etaSummary)
@@ -132,7 +135,7 @@ struct HuaweiBandBatteryWidget: Widget {
             BatteryWidgetEntryView(entry: entry)
         }
         .configurationDisplayName("Pin Huawei Band 11")
-        .description("Theo dõi % pin và thời gian dùng dự kiến của Huawei Band 11.")
+        .description("Theo dõi % pin, dòng sạc/xả và thời gian dùng dự kiến của Huawei Band 11.")
         .supportedFamilies([.systemSmall, .systemMedium, .accessoryCircular])
     }
 }

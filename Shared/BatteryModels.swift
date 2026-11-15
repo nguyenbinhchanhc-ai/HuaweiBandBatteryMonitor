@@ -1,6 +1,6 @@
 import Foundation
 
-/// App Group identifier shared between the main app and the Widget extension.
+/// App Group identifier and UserDefaults keys shared between the app and Widget extension.
 public enum AppConstants {
     public static let appGroupIdentifier = "group.com.bandpulse.battery"
     public static let widgetSnapshotKey = "bandpulse.widget.snapshot.v1"
@@ -9,10 +9,27 @@ public enum AppConstants {
     public static let usageProfileKey = "bandpulse.usage.profile"
     public static let chargeAlertTargetKey = "bandpulse.alert.chargeTarget"
     public static let lowBatteryAlertKey = "bandpulse.alert.lowBattery"
+    public static let readHeartRateKey = "bandpulse.ble.readHeartRate"
     public static let backgroundTaskIdentifier = "com.bandpulse.battery.refresh"
 }
 
-/// Usage profile presets calibrated against Huawei Band 11 official endurance benchmarks.
+/// Physical battery specification for Huawei Band 11 used to derive effective charge/discharge current (mA).
+public enum BatteryHardwareSpec {
+    public static let capacitymAh: Double = 300.0
+    public static let nominalVoltage: Double = 3.85
+
+    /// Converts a percentage rate per hour (%/h) into effective current in milliamperes (mA).
+    public static func effectiveCurrentmA(percentPerHour: Double) -> Double {
+        (percentPerHour / 100.0) * capacitymAh
+    }
+
+    /// Converts effective current in mA to approximate power in milliwatts (mW).
+    public static func effectivePowermW(currentmA: Double) -> Double {
+        currentmA * nominalVoltage
+    }
+}
+
+/// Optional initial baseline used ONLY before the first real 1% change is observed via Bluetooth.
 public enum UsageProfile: String, Codable, CaseIterable, Identifiable, Sendable {
     case light
     case typical
@@ -22,21 +39,21 @@ public enum UsageProfile: String, Codable, CaseIterable, Identifiable, Sendable 
 
     public var displayName: String {
         switch self {
-        case .light: return "Tiết kiệm (~14 ngày)"
-        case .typical: return "Thường ngày (~8 ngày)"
-        case .alwaysOnDisplay: return "Bật AOD (~3 ngày)"
+        case .light: return "Nhẹ (~14 ngày)"
+        case .typical: return "Thường (~8 ngày)"
+        case .alwaysOnDisplay: return "AOD (~3 ngày)"
         }
     }
 
     public var shortName: String {
         switch self {
-        case .light: return "Tiết kiệm"
+        case .light: return "Nhẹ"
         case .typical: return "Thường"
         case .alwaysOnDisplay: return "AOD"
         }
     }
 
-    /// Prior baseline drain rate in percentage points per hour.
+    /// Prior drain rate in %/hour used strictly before any real BLE slope is measured.
     public var baselineDrainPerHour: Double {
         switch self {
         case .light: return 100.0 / (14.0 * 24.0)
@@ -74,17 +91,17 @@ public enum SampleSource: String, Codable, Sendable {
     }
 }
 
-/// Confidence level for battery life and charge duration predictions.
+/// Confidence level based on real Bluetooth sample density rather than static presets.
 public enum PredictionConfidence: String, Codable, Sendable {
-    case low
-    case medium
-    case high
+    case awaitingDelta
+    case measuring
+    case realTimeHigh
 
     public var displayName: String {
         switch self {
-        case .low: return "Ước tính sơ bộ"
-        case .medium: return "Độ tin cậy khá"
-        case .high: return "Độ tin cậy cao"
+        case .awaitingDelta: return "Chờ biến thiên 1%"
+        case .measuring: return "Đang đo thực tế"
+        case .realTimeHigh: return "Realtime chính xác"
         }
     }
 }
@@ -153,25 +170,93 @@ public struct BatterySessionRecord: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
-/// Forecast output while the band is charging.
+/// Real-time forecast output while the band is charging.
 public struct ChargeEstimate: Equatable, Sendable {
     public let currentLevel: Int
     public let minutesToFull: Double
     public let estimatedFullDate: Date
+    /// Blended recent charge rate (%/min).
     public let ratePerMinute: Double
+    /// Instantaneous rate from the latest consecutive percentage jump (%/min).
+    public let instantRatePerMinute: Double
+    /// Effective charging current derived from 300 mAh capacity (+mA).
+    public let effectiveCurrentmA: Double
+    /// Instantaneous charging current from the most recent +1% interval (+mA).
+    public let instantCurrentmA: Double
     public let elapsedMinutes: Double
     public let confidence: PredictionConfidence
 }
 
-/// Forecast output while the band is discharging.
+/// Real-time forecast output while the band is discharging.
 public struct DischargeEstimate: Equatable, Sendable {
     public let currentLevel: Int
     public let remainingHours: Double
     public let estimatedEmptyDate: Date
+    /// Regression / sliding-window drain rate (%/hour).
     public let drainPerHour: Double
     public let drainPerDay: Double
+    /// Instantaneous drain rate from the most recent consecutive percentage drop (%/hour).
+    public let instantDrainPerHour: Double
+    /// Effective average discharge current derived from 300 mAh capacity (-mA, returned as positive magnitude).
+    public let effectiveCurrentmA: Double
+    /// Instantaneous discharge current from the latest drop interval (mA).
+    public let instantCurrentmA: Double
     public let estimatedFullCycleDays: Double
     public let confidence: PredictionConfidence
+    public let isUsingFallbackPrior: Bool
+}
+
+/// Live GATT characteristic inspection snapshot for debugging all readable BLE channels.
+public struct GATTCharacteristicSnapshot: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let uuid: String
+    public let name: String
+    public let propertiesDescription: String
+    public let hexValue: String
+    public let decodedSummary: String
+    public let isNotifying: Bool
+    public let canRead: Bool
+    public let canNotify: Bool
+    public let updatedAt: Date?
+
+    public init(
+        id: String,
+        uuid: String,
+        name: String,
+        propertiesDescription: String,
+        hexValue: String,
+        decodedSummary: String,
+        isNotifying: Bool,
+        canRead: Bool,
+        canNotify: Bool,
+        updatedAt: Date?
+    ) {
+        self.id = id
+        self.uuid = uuid
+        self.name = name
+        self.propertiesDescription = propertiesDescription
+        self.hexValue = hexValue
+        self.decodedSummary = decodedSummary
+        self.isNotifying = isNotifying
+        self.canRead = canRead
+        self.canNotify = canNotify
+        self.updatedAt = updatedAt
+    }
+}
+
+/// Live GATT service inspection snapshot.
+public struct GATTServiceSnapshot: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let uuid: String
+    public let title: String
+    public var characteristics: [GATTCharacteristicSnapshot]
+
+    public init(id: String, uuid: String, title: String, characteristics: [GATTCharacteristicSnapshot]) {
+        self.id = id
+        self.uuid = uuid
+        self.title = title
+        self.characteristics = characteristics
+    }
 }
 
 /// Lightweight snapshot serialized to App Group defaults for WidgetKit.
@@ -182,6 +267,7 @@ public struct WidgetBatterySnapshot: Codable, Equatable, Sendable {
     public let updatedAt: Date
     public let etaSummary: String
     public let rateSummary: String
+    public let currentSummary: String
     public let isConnected: Bool
 
     public init(
@@ -191,6 +277,7 @@ public struct WidgetBatterySnapshot: Codable, Equatable, Sendable {
         updatedAt: Date,
         etaSummary: String,
         rateSummary: String,
+        currentSummary: String = "",
         isConnected: Bool
     ) {
         self.deviceName = deviceName
@@ -199,6 +286,7 @@ public struct WidgetBatterySnapshot: Codable, Equatable, Sendable {
         self.updatedAt = updatedAt
         self.etaSummary = etaSummary
         self.rateSummary = rateSummary
+        self.currentSummary = currentSummary
         self.isConnected = isConnected
     }
 }

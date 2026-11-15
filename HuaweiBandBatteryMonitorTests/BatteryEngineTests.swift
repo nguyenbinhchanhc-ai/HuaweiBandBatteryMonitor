@@ -20,6 +20,28 @@ final class BatteryEngineTests: XCTestCase {
         XCTAssertEqual(result.recordedSample?.level, 88)
     }
 
+    func testDoesNotDeduplicateWhenLevelChangesImmediately() {
+        let first = BatterySessionStateMachine.processReading(
+            level: 88,
+            timestamp: baseDate,
+            source: .bleNotify,
+            activeSession: nil,
+            lastSample: nil,
+            usageProfile: .typical
+        )
+
+        let second = BatterySessionStateMachine.processReading(
+            level: 87,
+            timestamp: baseDate.addingTimeInterval(30),
+            source: .bleNotify,
+            activeSession: first.activeSession,
+            lastSample: first.recordedSample,
+            usageProfile: .typical
+        )
+
+        XCTAssertEqual(second.recordedSample?.level, 87)
+    }
+
     func testDeduplicatesIdenticalReadingWithinFiveMinutes() {
         let first = BatterySessionStateMachine.processReading(
             level: 88,
@@ -55,7 +77,6 @@ final class BatteryEngineTests: XCTestCase {
             usageProfile: .typical
         )
 
-        // Battery rises -> starts charging anchored at t0 / 30%
         let t1 = t0.addingTimeInterval(600)
         let s2 = BatterySessionStateMachine.processReading(
             level: 38,
@@ -72,7 +93,6 @@ final class BatteryEngineTests: XCTestCase {
         XCTAssertEqual(s2.activeSession.startLevel, 30)
         XCTAssertEqual(s2.activeSession.endLevel, 38)
 
-        // Battery drops -> closes charging at 38% and starts discharging
         let t2 = t1.addingTimeInterval(3600)
         let s3 = BatterySessionStateMachine.processReading(
             level: 37,
@@ -90,7 +110,7 @@ final class BatteryEngineTests: XCTestCase {
         XCTAssertEqual(s3.activeSession.endLevel, 37)
     }
 
-    func testChargeEstimatorAccountsForCVTaperAboveEightyPercent() {
+    func testChargeEstimatorComputesEffectiveMilliampsAndCVTaper() {
         let session = BatterySessionRecord(
             type: .charging,
             startTime: baseDate,
@@ -100,6 +120,7 @@ final class BatteryEngineTests: XCTestCase {
         )
         let samples = [
             BatterySampleRecord(timestamp: baseDate, level: 40, source: .bleNotify, sessionID: session.id),
+            BatterySampleRecord(timestamp: baseDate.addingTimeInterval(5 * 60), level: 50, source: .bleNotify, sessionID: session.id),
             BatterySampleRecord(timestamp: baseDate.addingTimeInterval(10 * 60), level: 60, source: .bleNotify, sessionID: session.id)
         ]
 
@@ -111,46 +132,44 @@ final class BatteryEngineTests: XCTestCase {
         )
 
         XCTAssertNotNil(estimate)
-        // Rate = 2.0%/min -> 60->80 takes 10 min; 80->100 at 0.65x (1.3%/min) takes ~15.38 min => ~25.38 min
+        // Rate = 2.0%/min = 120%/hour -> 1.2 * 300 mAh = 360 mA effective charge current
         XCTAssertEqual(estimate?.ratePerMinute ?? 0, 2.0, accuracy: 0.05)
+        XCTAssertEqual(estimate?.effectiveCurrentmA ?? 0, 360.0, accuracy: 5.0)
         XCTAssertEqual(estimate?.minutesToFull ?? 0, 25.38, accuracy: 0.5)
-        XCTAssertEqual(estimate?.confidence, .high)
+        XCTAssertEqual(estimate?.confidence, .realTimeHigh)
     }
 
-    func testDischargeEstimatorBlendsRecentRateWithProfileAndHistory() {
-        let historySession = BatterySessionRecord(
-            type: .discharging,
-            startTime: baseDate.addingTimeInterval(-100 * 3600),
-            endTime: baseDate.addingTimeInterval(-50 * 3600),
-            startLevel: 100,
-            endLevel: 50, // 1.0% / hour
-            isActive: false
-        )
-
-        let activeStart = baseDate.addingTimeInterval(-24 * 3600)
+    func testDischargeEstimatorUsesLiveOLSRegressionWithoutPresetClamp() {
+        // Simulate real heavy usage (~2.0%/hour = 6.0 mA on 300 mAh cell) even though profile is .light
+        let activeStart = baseDate.addingTimeInterval(-6 * 3600)
         let activeSession = BatterySessionRecord(
             type: .discharging,
             startTime: activeStart,
-            startLevel: 100,
-            endLevel: 76, // 1.0% / hour over 24h
-            isActive: true
+            startLevel: 88,
+            endLevel: 76,
+            isActive: true,
+            usageProfile: .light
         )
         let samples = [
-            BatterySampleRecord(timestamp: activeStart, level: 100, source: .bleRead, sessionID: activeSession.id),
-            BatterySampleRecord(timestamp: baseDate, level: 76, source: .bleRead, sessionID: activeSession.id)
+            BatterySampleRecord(timestamp: activeStart, level: 88, source: .bleNotify, sessionID: activeSession.id),
+            BatterySampleRecord(timestamp: activeStart.addingTimeInterval(2 * 3600), level: 84, source: .bleNotify, sessionID: activeSession.id),
+            BatterySampleRecord(timestamp: activeStart.addingTimeInterval(4 * 3600), level: 80, source: .bleNotify, sessionID: activeSession.id),
+            BatterySampleRecord(timestamp: baseDate, level: 76, source: .bleNotify, sessionID: activeSession.id)
         ]
 
         let estimate = BatteryPredictor.estimateDischarge(
             activeSession: activeSession,
             sessionSamples: samples,
-            historicalDischargeSessions: [historySession],
-            profile: .typical,
+            historicalDischargeSessions: [],
+            profile: .light,
             now: baseDate
         )
 
-        XCTAssertEqual(estimate.drainPerHour, 1.0, accuracy: 0.05)
-        XCTAssertEqual(estimate.remainingHours, 76.0, accuracy: 3.0)
-        XCTAssertEqual(estimate.confidence, .high)
+        XCTAssertFalse(estimate.isUsingFallbackPrior)
+        XCTAssertEqual(estimate.drainPerHour, 2.0, accuracy: 0.05)
+        XCTAssertEqual(estimate.effectiveCurrentmA, 6.0, accuracy: 0.2)
+        XCTAssertEqual(estimate.remainingHours, 38.0, accuracy: 1.0)
+        XCTAssertEqual(estimate.confidence, .realTimeHigh)
     }
 
     func testWidgetSnapshotRoundTripEncoding() {
@@ -161,6 +180,7 @@ final class BatteryEngineTests: XCTestCase {
             updatedAt: baseDate,
             etaSummary: "Còn ~7 ngày 1 giờ",
             rateSummary: "-12.5%/ngày",
+            currentSummary: "-1.56 mA",
             isConnected: true
         )
 

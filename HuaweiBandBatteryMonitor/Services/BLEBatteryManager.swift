@@ -32,12 +32,19 @@ struct DiscoveredBLEDevice: Identifiable, Equatable {
     let isSystemConnected: Bool
 }
 
-/// CoreBluetooth central manager dedicated to reading standard Battery Service (0x180F / 0x2A19)
-/// from Huawei Band 11 alongside the official Huawei Health connection.
+/// CoreBluetooth central manager that discovers all readable GATT services on Huawei Band 11,
+/// subscribes to Battery Service (0x180F / 0x2A19) + Heart Rate (0x180D / 0x2A37),
+/// and uses adaptive polling + State Restoration for maximum iOS background continuity.
 final class BLEBatteryManager: NSObject, ObservableObject {
     static let batteryServiceUUID = CBUUID(string: "180F")
-    static let batteryLevelCharacteristicUUID = CBUUID(string: "2A19")
+    static let batteryLevelUUID = CBUUID(string: "2A19")
+    static let batteryPowerStateUUID = CBUUID(string: "2A1A")
+    static let batteryLevelStateUUID = CBUUID(string: "2A1B")
+
     static let heartRateServiceUUID = CBUUID(string: "180D")
+    static let heartRateMeasurementUUID = CBUUID(string: "2A37")
+    static let deviceInfoServiceUUID = CBUUID(string: "180A")
+
     private static let restoreIdentifier = "com.bandpulse.battery.central"
 
     @Published private(set) var connectionState: BLEConnectionState = .idle
@@ -45,9 +52,20 @@ final class BLEBatteryManager: NSObject, ObservableObject {
     @Published private(set) var connectedDeviceUUID: UUID?
     @Published private(set) var lastBatteryLevel: Int?
     @Published private(set) var lastUpdatedAt: Date?
+    @Published private(set) var liveHeartRateBPM: Int?
+    @Published private(set) var currentRSSI: Int?
     @Published private(set) var supportsNotify: Bool = false
+    @Published private(set) var firmwareChargingFlag: Bool?
+    @Published private(set) var deviceInfoFields: [String: String] = [:]
+    @Published private(set) var gattServices: [GATTServiceSnapshot] = []
     @Published private(set) var discoveredDevices: [DiscoveredBLEDevice] = []
     @Published private(set) var statusMessage: String = "Đang tìm Huawei Band 11..."
+    @Published var enableHeartRateStream: Bool {
+        didSet {
+            UserDefaults.standard.set(enableHeartRateStream, forKey: AppConstants.readHeartRateKey)
+            applyHeartRateSubscription()
+        }
+    }
 
     var onBatteryReading: ((Int, SampleSource, String?) -> Void)?
     var onConnectionChanged: ((String?, Bool) -> Void)?
@@ -55,15 +73,26 @@ final class BLEBatteryManager: NSObject, ObservableObject {
     private var centralManager: CBCentralManager!
     private var activePeripheral: CBPeripheral?
     private var batteryCharacteristic: CBCharacteristic?
+    private var heartRateCharacteristic: CBCharacteristic?
+    private var characteristicIndex: [String: CBCharacteristic] = [:]
     private var pollTimer: Timer?
+    private var activePollInterval: TimeInterval = 30
     private var pendingReadContinuation: CheckedContinuation<Int?, Never>?
 
     override init() {
+        if UserDefaults.standard.object(forKey: AppConstants.readHeartRateKey) == nil {
+            self.enableHeartRateStream = true
+        } else {
+            self.enableHeartRateStream = UserDefaults.standard.bool(forKey: AppConstants.readHeartRateKey)
+        }
         super.init()
         self.centralManager = CBCentralManager(
             delegate: self,
             queue: .main,
-            options: [CBCentralManagerOptionRestoreIdentifierKey: Self.restoreIdentifier]
+            options: [
+                CBCentralManagerOptionRestoreIdentifierKey: Self.restoreIdentifier,
+                CBCentralManagerOptionShowPowerAlertKey: true
+            ]
         )
         self.connectedDeviceName = UserDefaults.standard.string(forKey: AppConstants.selectedDeviceNameKey)
         if let rawUUID = UserDefaults.standard.string(forKey: AppConstants.selectedDeviceUUIDKey) {
@@ -71,17 +100,28 @@ final class BLEBatteryManager: NSObject, ObservableObject {
         }
     }
 
-    /// Attempts to attach to an already-connected Huawei Band 11 (or saved UUID) without dropping Huawei Health.
+    /// Dynamically speeds up BLE polling during charging (12s) vs discharging (30s).
+    func updateAdaptivePolling(isCharging: Bool) {
+        let desired: TimeInterval = isCharging ? 12 : 30
+        guard abs(desired - activePollInterval) > 0.1 || pollTimer == nil else { return }
+        activePollInterval = desired
+        if connectionState == .connected {
+            startPollingTimer()
+        }
+    }
+
+    /// Attaches to an already-connected Huawei Band 11 (or saved UUID) without dropping Huawei Health.
     func connectToSavedOrSystemBand() {
         guard centralManager.state == .poweredOn else {
             updateStateForCentral(centralManager.state)
             return
         }
 
-        // 1. Check already-connected peripherals exposing 0x180F (or 0x180D as secondary hint).
         let systemConnected = centralManager.retrieveConnectedPeripherals(withServices: [
             Self.batteryServiceUUID,
-            Self.heartRateServiceUUID
+            Self.heartRateServiceUUID,
+            CBUUID(string: "3802"),
+            CBUUID(string: "FE86")
         ])
 
         refreshDiscoveredList(withSystemPeripherals: systemConnected)
@@ -98,8 +138,10 @@ final class BLEBatteryManager: NSObject, ObservableObject {
             }
         }
 
-        // Prefer Huawei Band if multiple 0x180F peripherals are connected.
-        if let huawei = systemConnected.first(where: { ($0.name ?? "").localizedCaseInsensitiveContains("huawei") || ($0.name ?? "").localizedCaseInsensitiveContains("band") }) {
+        if let huawei = systemConnected.first(where: {
+            let name = $0.name ?? ""
+            return name.localizedCaseInsensitiveContains("huawei") || name.localizedCaseInsensitiveContains("band")
+        }) {
             connect(to: huawei)
             return
         }
@@ -118,11 +160,13 @@ final class BLEBatteryManager: NSObject, ObservableObject {
             return
         }
         connectionState = .scanning
-        statusMessage = "Đang quét thiết bị BLE..."
+        statusMessage = "Đang quét toàn bộ thiết bị BLE..."
 
         let systemConnected = centralManager.retrieveConnectedPeripherals(withServices: [
             Self.batteryServiceUUID,
-            Self.heartRateServiceUUID
+            Self.heartRateServiceUUID,
+            CBUUID(string: "3802"),
+            CBUUID(string: "FE86")
         ])
         refreshDiscoveredList(withSystemPeripherals: systemConnected)
 
@@ -159,9 +203,28 @@ final class BLEBatteryManager: NSObject, ObservableObject {
            peripheral.state == .connected,
            let char = batteryCharacteristic {
             peripheral.readValue(for: char)
+            peripheral.readRSSI()
         } else {
             connectToSavedOrSystemBand()
         }
+    }
+
+    /// Allows the user to manually read any readable characteristic from the GATT Inspector.
+    func readCharacteristic(id: String) {
+        guard let peripheral = activePeripheral,
+              peripheral.state == .connected,
+              let char = characteristicIndex[id],
+              char.properties.contains(.read) else { return }
+        peripheral.readValue(for: char)
+    }
+
+    /// Allows the user to toggle passive Notify observation on any notifiable characteristic in GATT Inspector.
+    func toggleNotify(forCharacteristicID id: String) {
+        guard let peripheral = activePeripheral,
+              peripheral.state == .connected,
+              let char = characteristicIndex[id],
+              char.properties.contains(.notify) || char.properties.contains(.indicate) else { return }
+        peripheral.setNotifyValue(!char.isNotifying, for: char)
     }
 
     /// Async helper used by BGAppRefreshTask to perform a single BLE battery poll.
@@ -186,7 +249,7 @@ final class BLEBatteryManager: NSObject, ObservableObject {
         return nil
     }
 
-    // MARK: - Private Connection Lifecycle
+    // MARK: - Private Connection & GATT Discovery
 
     private func connect(to peripheral: CBPeripheral) {
         centralManager.stopScan()
@@ -201,15 +264,28 @@ final class BLEBatteryManager: NSObject, ObservableObject {
 
         if peripheral.state == .connected {
             connectionState = .connected
-            statusMessage = "Đang đọc Battery Service (0x180F)..."
-            peripheral.discoverServices([Self.batteryServiceUUID])
+            statusMessage = "Đang khám phá toàn bộ dịch vụ GATT..."
+            peripheral.discoverServices(nil)
+            peripheral.readRSSI()
         } else {
             connectionState = .connecting
             statusMessage = "Đang kết nối tới \(resolvedName)..."
             centralManager.connect(peripheral, options: [
                 CBConnectPeripheralOptionNotifyOnConnectionKey: true,
-                CBConnectPeripheralOptionNotifyOnDisconnectionKey: true
+                CBConnectPeripheralOptionNotifyOnDisconnectionKey: true,
+                CBConnectPeripheralOptionNotifyOnNotificationKey: true
             ])
+        }
+    }
+
+    private func applyHeartRateSubscription() {
+        guard let peripheral = activePeripheral,
+              peripheral.state == .connected,
+              let hrChar = heartRateCharacteristic,
+              hrChar.properties.contains(.notify) else { return }
+        peripheral.setNotifyValue(enableHeartRateStream, for: hrChar)
+        if !enableHeartRateStream {
+            liveHeartRateBPM = nil
         }
     }
 
@@ -231,12 +307,14 @@ final class BLEBatteryManager: NSObject, ObservableObject {
 
     private func startPollingTimer() {
         pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: true) { [weak self] _ in
+        pollTimer = Timer.scheduledTimer(withTimeInterval: activePollInterval, repeats: true) { [weak self] _ in
             guard let self,
                   let peripheral = self.activePeripheral,
-                  peripheral.state == .connected,
-                  let char = self.batteryCharacteristic else { return }
-            peripheral.readValue(for: char)
+                  peripheral.state == .connected else { return }
+            if let char = self.batteryCharacteristic {
+                peripheral.readValue(for: char)
+            }
+            peripheral.readRSSI()
         }
     }
 
@@ -255,6 +333,126 @@ final class BLEBatteryManager: NSObject, ObservableObject {
         default:
             connectionState = .idle
         }
+    }
+
+    private func rebuildGATTSnapshot(for peripheral: CBPeripheral) {
+        let services = peripheral.services ?? []
+        var built: [GATTServiceSnapshot] = []
+        characteristicIndex.removeAll()
+
+        for service in services {
+            let serviceUUID = service.uuid.uuidString
+            let chars = (service.characteristics ?? []).map { char -> GATTCharacteristicSnapshot in
+                let charID = "\(serviceUUID)/\(char.uuid.uuidString)"
+                characteristicIndex[charID] = char
+                let existing = gattServices
+                    .flatMap(\.characteristics)
+                    .first(where: { $0.id == charID })
+
+                let hex = char.value.map { Self.formatHex($0) } ?? (existing?.hexValue ?? "--")
+                let decoded = char.value.map { Self.decodeCharacteristicValue(uuid: char.uuid, data: $0) }
+                    ?? (existing?.decodedSummary ?? "Chưa đọc")
+
+                return GATTCharacteristicSnapshot(
+                    id: charID,
+                    uuid: char.uuid.uuidString,
+                    name: Self.friendlyName(for: char.uuid),
+                    propertiesDescription: Self.describeProperties(char.properties),
+                    hexValue: hex,
+                    decodedSummary: decoded,
+                    isNotifying: char.isNotifying,
+                    canRead: char.properties.contains(.read),
+                    canNotify: char.properties.contains(.notify) || char.properties.contains(.indicate),
+                    updatedAt: char.value != nil ? Date() : existing?.updatedAt
+                )
+            }
+            built.append(
+                GATTServiceSnapshot(
+                    id: serviceUUID,
+                    uuid: serviceUUID,
+                    title: Self.friendlyServiceTitle(for: service.uuid),
+                    characteristics: chars
+                )
+            )
+        }
+        gattServices = built
+    }
+
+    // MARK: - GATT Formatting & Decoding Helpers
+
+    private static func formatHex(_ data: Data) -> String {
+        data.map { String(format: "%02X", $0) }.joined(separator: " ")
+    }
+
+    private static func describeProperties(_ props: CBCharacteristicProperties) -> String {
+        var list: [String] = []
+        if props.contains(.read) { list.append("Read") }
+        if props.contains(.notify) { list.append("Notify") }
+        if props.contains(.indicate) { list.append("Indicate") }
+        if props.contains(.write) { list.append("Write") }
+        if props.contains(.writeWithoutResponse) { list.append("WriteNoResp") }
+        return list.isEmpty ? "None" : list.joined(separator: ", ")
+    }
+
+    private static func friendlyServiceTitle(for uuid: CBUUID) -> String {
+        switch uuid.uuidString.uppercased() {
+        case "180F": return "Battery Service (0x180F)"
+        case "180D": return "Heart Rate (0x180D)"
+        case "180A": return "Device Information (0x180A)"
+        case "FE86": return "Huawei Wear Protocol (0xFE86)"
+        case "3802": return "Huawei Accessory Service (0x3802)"
+        default: return "Service \(uuid.uuidString)"
+        }
+    }
+
+    private static func friendlyName(for uuid: CBUUID) -> String {
+        switch uuid.uuidString.uppercased() {
+        case "2A19": return "Battery Level (0x2A19)"
+        case "2A1A": return "Battery Power State (0x2A1A)"
+        case "2A1B": return "Battery Level State (0x2A1B)"
+        case "2A37": return "Heart Rate Measurement (0x2A37)"
+        case "2A38": return "Body Sensor Location (0x2A38)"
+        case "2A24": return "Model Number (0x2A24)"
+        case "2A25": return "Serial Number (0x2A25)"
+        case "2A26": return "Firmware Revision (0x2A26)"
+        case "2A27": return "Hardware Revision (0x2A27)"
+        case "2A29": return "Manufacturer Name (0x2A29)"
+        default: return uuid.uuidString
+        }
+    }
+
+    private static func decodeCharacteristicValue(uuid: CBUUID, data: Data) -> String {
+        switch uuid.uuidString.uppercased() {
+        case "2A19":
+            guard let pct = data.first else { return "--" }
+            return "\(pct)%"
+        case "2A37":
+            guard let bpm = parseHeartRateBPM(from: data) else { return "--" }
+            return "\(bpm) BPM"
+        case "2A24", "2A25", "2A26", "2A27", "2A28", "2A29":
+            return String(data: data, encoding: .utf8) ?? formatHex(data)
+        default:
+            if data.count == 1, let val = data.first {
+                return "uint8: \(val)"
+            }
+            if let ascii = String(data: data, encoding: .utf8),
+               ascii.allSatisfy({ $0.isASCII && !$0.isNewline }) {
+                return ascii
+            }
+            return formatHex(data)
+        }
+    }
+
+    private static func parseHeartRateBPM(from data: Data) -> Int? {
+        guard data.count >= 2 else { return nil }
+        let flags = data[data.startIndex]
+        let is16Bit = (flags & 0x01) != 0
+        if is16Bit, data.count >= 3 {
+            let low = UInt16(data[data.startIndex + 1])
+            let high = UInt16(data[data.startIndex + 2]) << 8
+            return Int(low | high)
+        }
+        return Int(data[data.startIndex + 1])
     }
 }
 
@@ -308,9 +506,10 @@ extension BLEBatteryManager: CBCentralManagerDelegate {
         connectionState = .connected
         let name = peripheral.name ?? connectedDeviceName ?? "HUAWEI Band 11"
         connectedDeviceName = name
-        statusMessage = "Đã kết nối \(name). Đang đọc pin..."
+        statusMessage = "Đã kết nối \(name). Đang khám phá dịch vụ BLE..."
         onConnectionChanged?(name, true)
-        peripheral.discoverServices([Self.batteryServiceUUID])
+        peripheral.discoverServices(nil)
+        peripheral.readRSSI()
         startPollingTimer()
     }
 
@@ -324,70 +523,129 @@ extension BLEBatteryManager: CBCentralManagerDelegate {
         connectionState = .disconnected
         pollTimer?.invalidate()
         batteryCharacteristic = nil
-        statusMessage = "Mất kết nối BLE. Đang chờ Band 11 kết nối lại..."
+        heartRateCharacteristic = nil
+        liveHeartRateBPM = nil
+        currentRSSI = nil
+        statusMessage = "Mất kết nối BLE. Đang tự chờ Band 11 nối lại..."
         onConnectionChanged?(connectedDeviceName, false)
 
-        // Ask CoreBluetooth to auto-reconnect when the band comes back in range.
-        central.connect(peripheral, options: nil)
+        central.connect(peripheral, options: [
+            CBConnectPeripheralOptionNotifyOnConnectionKey: true,
+            CBConnectPeripheralOptionNotifyOnDisconnectionKey: true,
+            CBConnectPeripheralOptionNotifyOnNotificationKey: true
+        ])
     }
 }
 
 // MARK: - CBPeripheralDelegate
 
 extension BLEBatteryManager: CBPeripheralDelegate {
+    func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        if error == nil {
+            currentRSSI = RSSI.intValue
+        }
+    }
+
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard error == nil, let services = peripheral.services else {
-            statusMessage = "Không tìm thấy Battery Service (0x180F)."
+            statusMessage = "Không thể đọc danh sách dịch vụ BLE."
             return
         }
-        guard let batteryService = services.first(where: { $0.uuid == Self.batteryServiceUUID }) else {
-            statusMessage = "Thiết bị này không mở dịch vụ pin 0x180F."
-            return
+        rebuildGATTSnapshot(for: peripheral)
+        for service in services {
+            peripheral.discoverCharacteristics(nil, for: service)
         }
-        peripheral.discoverCharacteristics([Self.batteryLevelCharacteristicUUID], for: batteryService)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard error == nil, let characteristics = service.characteristics else { return }
-        guard let levelChar = characteristics.first(where: { $0.uuid == Self.batteryLevelCharacteristicUUID }) else {
-            statusMessage = "Không tìm thấy characteristic 0x2A19."
-            return
-        }
+        rebuildGATTSnapshot(for: peripheral)
 
-        batteryCharacteristic = levelChar
-        supportsNotify = levelChar.properties.contains(.notify)
+        for char in characteristics {
+            switch char.uuid {
+            case Self.batteryLevelUUID:
+                batteryCharacteristic = char
+                supportsNotify = char.properties.contains(.notify)
+                if supportsNotify {
+                    peripheral.setNotifyValue(true, for: char)
+                }
+                if char.properties.contains(.read) {
+                    peripheral.readValue(for: char)
+                }
 
-        if supportsNotify {
-            peripheral.setNotifyValue(true, for: levelChar)
-        }
-        if levelChar.properties.contains(.read) {
-            peripheral.readValue(for: levelChar)
+            case Self.batteryPowerStateUUID, Self.batteryLevelStateUUID:
+                if char.properties.contains(.notify) {
+                    peripheral.setNotifyValue(true, for: char)
+                }
+                if char.properties.contains(.read) {
+                    peripheral.readValue(for: char)
+                }
+
+            case Self.heartRateMeasurementUUID:
+                heartRateCharacteristic = char
+                if enableHeartRateStream && char.properties.contains(.notify) {
+                    peripheral.setNotifyValue(true, for: char)
+                }
+
+            default:
+                // Read standard Device Info (0x180A) and Body Sensor Location passively without touching proprietary write channels.
+                if service.uuid == Self.deviceInfoServiceUUID || char.uuid == CBUUID(string: "2A38") {
+                    if char.properties.contains(.read) {
+                        peripheral.readValue(for: char)
+                    }
+                }
+            }
         }
         startPollingTimer()
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard error == nil,
-              characteristic.uuid == Self.batteryLevelCharacteristicUUID,
-              let data = characteristic.value,
-              let firstByte = data.first else {
-            return
+        guard error == nil, let data = characteristic.value else { return }
+        rebuildGATTSnapshot(for: peripheral)
+
+        switch characteristic.uuid {
+        case Self.batteryLevelUUID:
+            guard let firstByte = data.first else { return }
+            let level = min(100, max(0, Int(firstByte)))
+            let source: SampleSource = characteristic.isNotifying ? .bleNotify : .bleRead
+            let name = peripheral.name ?? connectedDeviceName
+
+            lastBatteryLevel = level
+            lastUpdatedAt = Date()
+            connectionState = .connected
+            statusMessage = "Realtime \(level)% • \(source.label)"
+
+            if let pending = pendingReadContinuation {
+                pendingReadContinuation = nil
+                pending.resume(returning: level)
+            }
+
+            onBatteryReading?(level, source, name)
+
+        case Self.batteryPowerStateUUID, Self.batteryLevelStateUUID:
+            // Standard BLE Battery Power State (bits 4..5 == 3 means charging).
+            if let byte = data.first {
+                let chargingBits = (byte >> 4) & 0x03
+                if chargingBits == 3 {
+                    firmwareChargingFlag = true
+                } else if chargingBits == 2 {
+                    firmwareChargingFlag = false
+                }
+            }
+
+        case Self.heartRateMeasurementUUID:
+            liveHeartRateBPM = Self.parseHeartRateBPM(from: data)
+
+        default:
+            if characteristic.service?.uuid == Self.deviceInfoServiceUUID,
+               let text = String(data: data, encoding: .utf8),
+               !text.isEmpty {
+                deviceInfoFields[Self.friendlyName(for: characteristic.uuid)] = text
+            }
         }
+    }
 
-        let level = min(100, max(0, Int(firstByte)))
-        let source: SampleSource = characteristic.isNotifying ? .bleNotify : .bleRead
-        let name = peripheral.name ?? connectedDeviceName
-
-        lastBatteryLevel = level
-        lastUpdatedAt = Date()
-        connectionState = .connected
-        statusMessage = "Đã đồng bộ \(level)% qua \(source.label)"
-
-        if let pending = pendingReadContinuation {
-            pendingReadContinuation = nil
-            pending.resume(returning: level)
-        }
-
-        onBatteryReading?(level, source, name)
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        rebuildGATTSnapshot(for: peripheral)
     }
 }
