@@ -1,0 +1,63 @@
+name: Build iOS IPA (SideStore)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test-and-build-ipa:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Run Unit Tests on iOS Simulator
+        run: |
+          SIM_DEST=$(xcrun simctl list devices available | grep -E "iPhone (16|15|17)" | head -n 1 | sed -E 's/.*\(([0-9A-F-]+)\).*/\1/')
+          if [ -z "$SIM_DEST" ]; then
+            SIM_DEST=$(xcrun simctl list devices available | grep "iPhone" | head -n 1 | sed -E 's/.*\(([0-9A-F-]+)\).*/\1/')
+          fi
+          echo "Using simulator UUID: $SIM_DEST"
+          xcodebuild test \
+            -project HuaweiBandBatteryMonitor.xcodeproj \
+            -scheme HuaweiBandBatteryMonitor \
+            -destination "platform=iOS Simulator,id=$SIM_DEST" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Build Unsigned iOS Archive
+        run: |
+          xcodebuild archive \
+            -project HuaweiBandBatteryMonitor.xcodeproj \
+            -scheme HuaweiBandBatteryMonitor \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/BandPulse.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package Dual IPAs for SideStore
+        run: |
+          mkdir -p dist
+          rm -rf Payload && mkdir -p Payload
+          cp -r build/BandPulse.xcarchive/Products/Applications/BandPulse.app Payload/
+          zip -qry dist/HuaweiBandBattery-WithWidget.ipa Payload
+
+          # Variant 2: Single App ID (strips Widget extension to save a free Apple ID slot in SideStore)
+          rm -rf Payload/BandPulse.app/PlugIns
+          zip -qry dist/HuaweiBandBattery-SingleAppID.ipa Payload
+          rm -rf Payload
+
+      - name: Upload SideStore IPA Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BandPulse-SideStore-IPAs
+          path: dist/*.ipa

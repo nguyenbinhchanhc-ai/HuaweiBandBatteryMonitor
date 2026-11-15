@@ -1,0 +1,68 @@
+name: HuaweiBandBatteryMonitor
+options:
+  bundleIdPrefix: com.bandpulse
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  HuaweiBandBatteryMonitor:
+    type: application
+    platform: iOS
+    sources:
+      - path: HuaweiBandBatteryMonitor
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.bandpulse.battery
+        PRODUCT_NAME: BandPulse
+        INFOPLIST_FILE: HuaweiBandBatteryMonitor/Info.plist
+        CODE_SIGN_ENTITLEMENTS: HuaweiBandBatteryMonitor/HuaweiBandBatteryMonitor.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+    dependencies:
+      - target: HuaweiBandBatteryWidget
+        embed: true
+
+  HuaweiBandBatteryWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: HuaweiBandBatteryWidget
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.bandpulse.battery.widget
+        PRODUCT_NAME: BandPulseWidget
+        INFOPLIST_FILE: HuaweiBandBatteryWidget/Info.plist
+        CODE_SIGN_ENTITLEMENTS: HuaweiBandBatteryWidget/HuaweiBandBatteryWidget.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        SKIP_INSTALL: YES
+
+  HuaweiBandBatteryMonitorTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: HuaweiBandBatteryMonitorTests
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.bandpulse.battery.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  HuaweiBandBatteryMonitor:
+    build:
+      targets:
+        HuaweiBandBatteryMonitor: all
+        HuaweiBandBatteryWidget: all
+        HuaweiBandBatteryMonitorTests: [test]
+    test:
+      targets:
+        - HuaweiBandBatteryMonitorTests
