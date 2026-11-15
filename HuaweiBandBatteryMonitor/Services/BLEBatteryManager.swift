@@ -58,6 +58,7 @@ final class BLEBatteryManager: NSObject, ObservableObject {
     @Published private(set) var firmwareChargingFlag: Bool?
     @Published private(set) var deviceInfoFields: [String: String] = [:]
     @Published private(set) var gattServices: [GATTServiceSnapshot] = []
+    @Published private(set) var protocolLogs: [BLEPacketLogEntry] = []
     @Published private(set) var discoveredDevices: [DiscoveredBLEDevice] = []
     @Published private(set) var statusMessage: String = "Đang tìm Huawei Band 11..."
     @Published var enableHeartRateStream: Bool {
@@ -227,6 +228,48 @@ final class BLEBatteryManager: NSObject, ObservableObject {
         peripheral.setNotifyValue(!char.isNotifying, for: char)
     }
 
+    /// Subscribes passively to all notifiable characteristics (including 0xFE02, 0xFE06, 0x4A02)
+    /// without writing any command bytes, keeping Huawei Health undisturbed.
+    func subscribeAllNotifiableCharacteristics() {
+        guard let peripheral = activePeripheral,
+              peripheral.state == .connected else { return }
+        for char in characteristicIndex.values {
+            if (char.properties.contains(.notify) || char.properties.contains(.indicate)) && !char.isNotifying {
+                peripheral.setNotifyValue(true, for: char)
+            }
+        }
+    }
+
+    /// Sends a user-initiated probe payload to a writable characteristic and logs the TX packet.
+    func writeCharacteristic(id: String, data: Data) {
+        guard let peripheral = activePeripheral,
+              peripheral.state == .connected,
+              let char = characteristicIndex[id] else { return }
+
+        let writeType: CBCharacteristicWriteType
+        if char.properties.contains(.writeWithoutResponse) {
+            writeType = .withoutResponse
+        } else if char.properties.contains(.write) {
+            writeType = .withResponse
+        } else {
+            return
+        }
+
+        appendPacketLog(direction: .tx, characteristicUUID: char.uuid, data: data)
+        peripheral.writeValue(data, for: char, type: writeType)
+    }
+
+    func clearProtocolLogs() {
+        protocolLogs.removeAll()
+    }
+
+    func exportProtocolLogsText() -> String {
+        let formatter = ISO8601DateFormatter()
+        return protocolLogs.map { entry in
+            "[\(formatter.string(from: entry.timestamp))] \(entry.direction.rawValue) \(entry.characteristicUUID) | \(entry.decodedSummary) | HEX: \(entry.rawHex)"
+        }.joined(separator: "\n")
+    }
+
     /// Async helper used by BGAppRefreshTask to perform a single BLE battery poll.
     @MainActor
     func performBackgroundPoll() async -> Int? {
@@ -363,6 +406,7 @@ final class BLEBatteryManager: NSObject, ObservableObject {
                     isNotifying: char.isNotifying,
                     canRead: char.properties.contains(.read),
                     canNotify: char.properties.contains(.notify) || char.properties.contains(.indicate),
+                    canWrite: char.properties.contains(.write) || char.properties.contains(.writeWithoutResponse),
                     updatedAt: char.value != nil ? Date() : existing?.updatedAt
                 )
             }
@@ -376,6 +420,23 @@ final class BLEBatteryManager: NSObject, ObservableObject {
             )
         }
         gattServices = built
+    }
+
+    private func appendPacketLog(direction: PacketDirection, characteristicUUID: CBUUID, data: Data) {
+        let parsed = HuaweiProtocolDecoder.parseFrame(data)
+        let summary = parsed?.summary ?? Self.decodeCharacteristicValue(uuid: characteristicUUID, data: data)
+        let entry = BLEPacketLogEntry(
+            timestamp: Date(),
+            direction: direction,
+            characteristicUUID: characteristicUUID.uuidString,
+            rawHex: Self.formatHex(data),
+            decodedSummary: summary,
+            parsedFrame: parsed
+        )
+        protocolLogs.insert(entry, at: 0)
+        if protocolLogs.count > 200 {
+            protocolLogs.removeLast(protocolLogs.count - 200)
+        }
     }
 
     // MARK: - GATT Formatting & Decoding Helpers
@@ -601,6 +662,7 @@ extension BLEBatteryManager: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard error == nil, let data = characteristic.value else { return }
+        appendPacketLog(direction: .rx, characteristicUUID: characteristic.uuid, data: data)
         rebuildGATTSnapshot(for: peripheral)
 
         switch characteristic.uuid {

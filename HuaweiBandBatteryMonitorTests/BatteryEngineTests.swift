@@ -188,4 +188,31 @@ final class BatteryEngineTests: XCTestCase {
         let loaded = SharedSnapshotStore.load()
         XCTAssertEqual(loaded, snapshot)
     }
+
+    func testHuaweiCRC16XModemStandardVector() {
+        let payload = Data("123456789".utf8)
+        XCTAssertEqual(HuaweiCRC16.xmodem(payload), 0x31C3)
+    }
+
+    func testHuaweiProtocolFrameBuildAndParseRoundTrip() {
+        let frameData = HuaweiProtocolDecoder.buildFrame(
+            serviceID: 0x01,
+            commandID: 0x08,
+            tlvs: [
+                (tag: 0x01, value: Data([0x58])), // 88%
+                (tag: 0x02, value: Data([0x01]))
+            ]
+        )
+
+        let parsed = HuaweiProtocolDecoder.parseFrame(frameData)
+        XCTAssertNotNil(parsed)
+        XCTAssertEqual(parsed?.crcValid, true)
+        XCTAssertEqual(parsed?.serviceID, 0x01)
+        XCTAssertEqual(parsed?.commandID, 0x08)
+        XCTAssertEqual(parsed?.tlvs.count, 2)
+        XCTAssertEqual(parsed?.tlvs[0].tag, 0x01)
+        XCTAssertEqual(parsed?.tlvs[0].integerValue, 88)
+        XCTAssertEqual(parsed?.tlvs[1].tag, 0x02)
+        XCTAssertEqual(parsed?.tlvs[1].integerValue, 1)
+    }
 }

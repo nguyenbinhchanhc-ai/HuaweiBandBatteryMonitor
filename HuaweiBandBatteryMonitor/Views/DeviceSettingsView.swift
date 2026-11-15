@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct DeviceSettingsView: View {
     @ObservedObject var store: BatteryStore
@@ -56,6 +57,18 @@ struct DeviceSettingsView: View {
                             Label("GATT Live Inspector", systemImage: "waveform.and.magnifyingglass")
                             Spacer()
                             Text("\(bleManager.gattServices.count) dịch vụ")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    NavigationLink {
+                        ProtocolLabView(bleManager: bleManager)
+                    } label: {
+                        HStack {
+                            Label("0xFE86 Sniffer & Frame Lab", systemImage: "terminal")
+                            Spacer()
+                            Text("\(bleManager.protocolLogs.count) gói")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -210,5 +223,187 @@ struct GATTInspectorView: View {
                 }
             }
         }
+    }
+}
+
+/// Interactive sniffer & decoder for Huawei 0x5A Link Protocol frames (CRC16-CCITT + TLV)
+/// plus user-initiated hex probe testing.
+struct ProtocolLabView: View {
+    @ObservedObject var bleManager: BLEBatteryManager
+
+    @State private var selectedTargetID: String = ""
+    @State private var serviceHex: String = "01"
+    @State private var commandHex: String = "08"
+    @State private var rawHexInput: String = ""
+    @State private var useRawHexMode: Bool = false
+    @State private var copiedFeedback: Bool = false
+
+    private var writableCharacteristics: [GATTCharacteristicSnapshot] {
+        bleManager.gattServices
+            .flatMap(\.characteristics)
+            .filter(\.canWrite)
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Button {
+                    bleManager.subscribeAllNotifiableCharacteristics()
+                } label: {
+                    Label("Nghe thụ động toàn bộ kênh Notify (0xFE02, 0xFE06, 0x4A02...)", systemImage: "ear.badge.waveform")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.cyan)
+
+                Text("Bật Notify thụ động hoàn toàn an toàn, không ghi lệnh nên giữ nguyên kết nối với Huawei Health. Sau khi bấm, hãy sang Huawei Health kéo đồng bộ rồi quay lại xem Log bên dưới.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("1. Nghe thụ động (An toàn 100%)")
+            }
+
+            Section {
+                if writableCharacteristics.isEmpty {
+                    Text("Chưa thấy đặc tính Write nào. Hãy kết nối Band 11 trước.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("Kênh gửi (Write)", selection: $selectedTargetID) {
+                        ForEach(writableCharacteristics) { char in
+                            Text("\(char.name) (\(char.propertiesDescription))").tag(char.id)
+                        }
+                    }
+                    .onAppear {
+                        if selectedTargetID.isEmpty {
+                            selectedTargetID = writableCharacteristics.first(where: { $0.uuid.uppercased() == "FE01" })?.id
+                                ?? writableCharacteristics.first?.id
+                                ?? ""
+                        }
+                    }
+
+                    Toggle("Nhập Raw Hex thủ công", isOn: $useRawHexMode)
+
+                    if useRawHexMode {
+                        TextField("VD: 5A 00 03 00 01 08 61 6C", text: $rawHexInput)
+                            .font(.caption.monospaced())
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                    } else {
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text("ServiceID (Hex)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                TextField("01", text: $serviceHex)
+                                    .font(.subheadline.monospaced())
+                                    .textInputAutocapitalization(.characters)
+                            }
+                            VStack(alignment: .leading) {
+                                Text("CommandID (Hex)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                TextField("08", text: $commandHex)
+                                    .font(.subheadline.monospaced())
+                                    .textInputAutocapitalization(.characters)
+                            }
+                        }
+
+                        if let preview = buildProbeData() {
+                            Text("Khung 0x5A + CRC16: \(preview.map { String(format: "%02X", $0) }.joined(separator: " "))")
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.cyan)
+                        }
+                    }
+
+                    Button {
+                        if let data = buildProbeData(), !selectedTargetID.isEmpty {
+                            bleManager.writeCharacteristic(id: selectedTargetID, data: data)
+                        }
+                    } label: {
+                        Label("Gửi gói thăm dò", systemImage: "paperplane.fill")
+                    }
+                    .disabled(buildProbeData() == nil || selectedTargetID.isEmpty)
+
+                    Text("Cảnh báo: Gửi gói Write lên 0xFE01 trong lúc Huawei Health đang chạy có thể khiến Band từ chối hoặc tạm ngắt phiên Huawei Health (chỉ cần mở lại Huawei Health để nối lại).")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            } header: {
+                Text("2. Thử gửi gói khung 0x5A (Nâng cao)")
+            }
+
+            Section {
+                HStack {
+                    Button {
+                        UIPasteboard.general.string = bleManager.exportProtocolLogsText()
+                        copiedFeedback = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                            copiedFeedback = false
+                        }
+                    } label: {
+                        Label(copiedFeedback ? "Đã copy!" : "Copy toàn bộ Log", systemImage: "doc.on.doc")
+                    }
+                    .disabled(bleManager.protocolLogs.isEmpty)
+
+                    Spacer()
+
+                    Button(role: .destructive) {
+                        bleManager.clearProtocolLogs()
+                    } label: {
+                        Text("Xóa Log")
+                    }
+                    .disabled(bleManager.protocolLogs.isEmpty)
+                }
+
+                if bleManager.protocolLogs.isEmpty {
+                    Text("Chưa có gói tin nào. Hãy bật Notify và đồng bộ thử.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(bleManager.protocolLogs) { entry in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(entry.direction.rawValue)
+                                    .font(.caption2.bold())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(entry.direction == .rx ? Color.green.opacity(0.2) : Color.orange.opacity(0.2))
+                                    .foregroundStyle(entry.direction == .rx ? .green : .orange)
+                                    .clipShape(Capsule())
+                                Text(entry.characteristicUUID)
+                                    .font(.caption.bold())
+                                Spacer()
+                                Text(entry.timestamp.formatted(date: .omitted, time: .standard))
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(entry.decodedSummary)
+                                .font(.caption)
+                                .foregroundStyle(.cyan)
+                            Text(entry.rawHex)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        .padding(.vertical, 3)
+                    }
+                }
+            } header: {
+                Text("3. Nhật ký gói tin RX/TX (\(bleManager.protocolLogs.count))")
+            }
+        }
+        .navigationTitle("0xFE86 Protocol Lab")
+    }
+
+    private func buildProbeData() -> Data? {
+        if useRawHexMode {
+            return HuaweiProtocolDecoder.dataFromHexString(rawHexInput)
+        }
+        guard let svc = UInt8(serviceHex.trimmingCharacters(in: .whitespacesAndNewlines), radix: 16),
+              let cmd = UInt8(commandHex.trimmingCharacters(in: .whitespacesAndNewlines), radix: 16) else {
+            return nil
+        }
+        return HuaweiProtocolDecoder.buildFrame(serviceID: svc, commandID: cmd)
     }
 }

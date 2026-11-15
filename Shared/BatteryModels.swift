@@ -206,7 +206,7 @@ public struct DischargeEstimate: Equatable, Sendable {
     public let isUsingFallbackPrior: Bool
 }
 
-/// Live GATT characteristic inspection snapshot for debugging all readable BLE channels.
+/// Live GATT characteristic inspection snapshot for debugging all readable and writable BLE channels.
 public struct GATTCharacteristicSnapshot: Identifiable, Equatable, Sendable {
     public let id: String
     public let uuid: String
@@ -217,6 +217,7 @@ public struct GATTCharacteristicSnapshot: Identifiable, Equatable, Sendable {
     public let isNotifying: Bool
     public let canRead: Bool
     public let canNotify: Bool
+    public let canWrite: Bool
     public let updatedAt: Date?
 
     public init(
@@ -229,6 +230,7 @@ public struct GATTCharacteristicSnapshot: Identifiable, Equatable, Sendable {
         isNotifying: Bool,
         canRead: Bool,
         canNotify: Bool,
+        canWrite: Bool = false,
         updatedAt: Date?
     ) {
         self.id = id
@@ -240,6 +242,7 @@ public struct GATTCharacteristicSnapshot: Identifiable, Equatable, Sendable {
         self.isNotifying = isNotifying
         self.canRead = canRead
         self.canNotify = canNotify
+        self.canWrite = canWrite
         self.updatedAt = updatedAt
     }
 }
